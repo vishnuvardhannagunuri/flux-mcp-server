@@ -1,22 +1,19 @@
 """
 flux_mcp_server.py
 ──────────────────
-General-purpose Flux CD MCP Server.
-Modelled on the official Flux Operator MCP tool set.
-Ref: https://fluxoperator.dev/docs/mcp/tools/
+Read-only Flux CD MCP Server for troubleshooting and diagnosis.
+No write, patch, delete, or reconcile operations.
 
-Tools:
-  REPORTING    → get_flux_instance, get_kubernetes_resources,
+Tool categories:
+  CONNECTION   — test_connection
+  REPORTING    — get_flux_instance, get_kubernetes_resources,
                  get_kubernetes_logs, get_kubernetes_metrics,
                  get_kubernetes_api_versions
-  RECONCILE    → reconcile_flux_source, reconcile_flux_kustomization,
-                 reconcile_flux_helmrelease
-  SUSPEND/RESUME → suspend_flux_reconciliation,
-                   resume_flux_reconciliation
-  CONNECTION   → test_connection
+  GITLAB       — get_gitlab_file, list_gitlab_files,
+                 get_gitlab_commits, get_gitlab_commit_diff,
+                 compare_gitlab_to_cluster
 
-The LLM reads raw cluster data from these tools and performs
-root-cause analysis itself — tools are data sources, not answers.
+Modelled on: https://fluxoperator.dev/docs/mcp/tools/#reporting-tools
 
 Run:  python flux_mcp_server.py
 """
@@ -27,6 +24,7 @@ from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 import flux_tools
+import gitlab_tools
 
 logging.basicConfig(
     stream=sys.stderr, level=logging.INFO,
@@ -51,27 +49,27 @@ def test_connection() -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════
-# REPORTING — read only, no cluster changes
+# REPORTING — cluster state, read-only
 # ══════════════════════════════════════════════════════════════════
 
 @mcp.tool()
 def get_flux_instance() -> dict:
     """
-    REPORTING — Flux installation health.
+    REPORTING — Flux controller health.
 
     Returns every controller (source-controller, kustomize-controller,
     helm-controller, etc.) with image version, ready replicas,
     and restart count.
 
-    Per Flux Operator MCP guidelines — call this FIRST when:
+    Call this FIRST when:
     - Nothing in the cluster is reconciling
     - All resources appear stuck
-    - 'Is Flux running?', 'What version of Flux is installed?'
+    - 'Is Flux running?', 'What version is installed?'
 
-    A crashed controller blocks ALL reconciliation for its resource type:
-    - source-controller down  → no sources sync
+    If a controller is down, ALL resources of that type are frozen:
+    - source-controller down    → no sources sync
     - kustomize-controller down → no Kustomizations apply
-    - helm-controller down    → no HelmReleases deploy
+    - helm-controller down      → no HelmReleases deploy
     """
     log.info("get_flux_instance")
     return flux_tools.get_flux_instance()
@@ -86,9 +84,9 @@ def get_kubernetes_resources(
     limit: int               = 50,
 ) -> dict:
     """
-    REPORTING — The primary read tool. Retrieves any Flux CRD or
-    core Kubernetes resource with full spec, status, conditions,
-    and inventory. The LLM reads this raw data to find root cause.
+    REPORTING — Retrieve any Flux CRD or core Kubernetes resource.
+    Returns full spec, status, conditions, and inventory.
+    The LLM reads this raw data to find the root cause.
 
     Supported Flux kinds (case-insensitive):
       kustomization, helmrelease,
@@ -97,50 +95,47 @@ def get_kubernetes_resources(
       imagerepository, imagepolicy, imageupdateautomation
 
     Supported core kinds:
-      pod, deployment, event, configmap, secret, replicaset
+      pod, deployment, event, configmap, secret
 
     Parameters:
       kind      — resource kind (required)
       name      — specific resource; omit to list all
       namespace — specific namespace; omit for all Flux namespaces
-      selector  — label selector e.g. 'app=nginx,env=prod'
+      selector  — label selector e.g. 'app=nginx'
       limit     — max results (default 50)
 
-    Per Flux Operator MCP instructions — after getting a resource,
-    the LLM should inspect these fields to find root cause:
+    After getting a resource the LLM should inspect:
 
       spec.sourceRef
-        Which GitRepository/HelmRepo this resource reads from.
-        If source is failing, this resource will also fail.
+        Which source this resource reads from.
+        If the source is failing, this resource will also fail.
 
-      spec.valuesFrom (HelmRelease)
-        ConfigMaps/Secrets passed as Helm values.
-        If any are missing → HelmRelease will fail.
+      spec.valuesFrom  (HelmRelease)
+        ConfigMaps/Secrets used as Helm values.
+        If any are missing the HelmRelease will fail.
 
-      spec.substituteFrom (Kustomization)
-        ConfigMaps/Secrets used for variable substitution.
-        If any are missing → Kustomization will fail.
+      spec.substituteFrom  (Kustomization)
+        ConfigMaps/Secrets for variable substitution.
+        If any are missing the Kustomization will fail.
 
-      spec.dependsOn
+      spec.dependsOn  (Kustomization)
         Other Kustomizations that must be Ready first.
-        If a dependency is failing → this one is blocked.
+        If a dependency is failing this one is blocked.
 
-      status.inventory (Kustomization)
-        Every Kubernetes resource managed by this Kustomization.
-        If a managed resource is failing → check its logs.
+      status.inventory  (Kustomization)
+        Every resource managed by this Kustomization.
+        If a managed resource is failing check its logs.
 
-      metadata.annotations with 'fluxcd.io' labels
-        Identifies the parent Kustomization or HelmRelease
-        that owns and manages this resource.
+      metadata.annotations with fluxcd.io labels
+        Identifies the parent Kustomization or HelmRelease.
 
-    Troubleshooting examples:
+    Use for:
       'Show all HelmReleases and their status'
-      'Get full detail of ingress-nginx HelmRelease'
       'Which Kustomizations are failing in nwdaf-cd?'
+      'Get full detail of ingress-nginx HelmRelease'
       'Show warning events for cert-manager'
       'List pods in flux-system'
       'Does the secret referenced in valuesFrom exist?'
-      'What resources does the flux-system Kustomization manage?'
     """
     log.info(f"get_kubernetes_resources kind={kind} name={name} "
              f"ns={namespace} selector={selector}")
@@ -160,38 +155,35 @@ def get_kubernetes_logs(
     """
     REPORTING — Get logs from a pod container.
 
-    Returns the last N log lines from a running or crashed container.
-    Use previous=True to get logs from the previously crashed instance —
-    this is the most important flag for diagnosing CrashLoopBackOff.
+    Returns the last N log lines. Use previous=True to get logs
+    from the previously crashed container — essential for diagnosing
+    CrashLoopBackOff and OOMKilled containers.
 
     Parameters:
       pod_name       — exact pod name
-      pod_namespace  — pod namespace
+      pod_namespace  — namespace the pod is in
       container_name — specific container (omit for first container)
-      limit          — log lines to return (default 100)
+      limit          — lines to return (default 100)
       previous       — get logs from previous crashed instance
 
-    Per Flux Operator MCP instructions, find the pod name first:
-      Step 1: get_kubernetes_resources(kind='deployment',
-                name='helm-controller', namespace='flux-system')
-              → read spec.selector.matchLabels
-
-      Step 2: get_kubernetes_resources(kind='pod',
-                selector='app=helm-controller',
-                namespace='flux-system')
-              → get exact pod name
-
-      Step 3: get_kubernetes_logs(pod_name='helm-controller-abc123',
-                pod_namespace='flux-system',
-                container_name='manager')
-              → read the actual error
+    Per Flux Operator MCP guidelines, find the pod name first:
+      1. get_kubernetes_resources(kind='deployment',
+                                  name='helm-controller',
+                                  namespace='flux-system')
+         → find spec.selector.matchLabels
+      2. get_kubernetes_resources(kind='pod',
+                                  selector='app=helm-controller',
+                                  namespace='flux-system')
+         → find exact pod name
+      3. get_kubernetes_logs(pod_name='helm-controller-xxx',
+                              pod_namespace='flux-system',
+                              container_name='manager')
 
     Use for:
       'Why is helm-controller crashing?'
-      'Show logs for the failing pod in nwdaf-cd'
+      'Show logs for the failing pod'
       'Get previous container logs after OOMKill'
       'What error is source-controller printing?'
-      'Why did the deployment pod fail?'
     """
     log.info(f"get_kubernetes_logs pod={pod_name} ns={pod_namespace} "
              f"previous={previous}")
@@ -211,7 +203,7 @@ def get_kubernetes_metrics(
     REPORTING — CPU and Memory usage for pods.
     Requires metrics-server installed in the cluster.
 
-    Use to diagnose resource exhaustion issues:
+    Use to diagnose resource exhaustion:
       'Is helm-controller being OOMKilled?'
       'Is source-controller CPU throttled?'
       'Show resource usage in nwdaf-cd'
@@ -228,12 +220,11 @@ def get_kubernetes_api_versions() -> dict:
     REPORTING — List all Flux CRDs with their preferred apiVersion.
 
     Per Flux Operator MCP guidelines:
-    Never assume the apiVersion of a resource.
-    Call this before querying if you are unsure of the version.
+    Never assume the apiVersion. Call this first when unsure.
 
     Use for:
       'What Flux CRDs are installed?'
-      'What apiVersion does HelmRelease use on this cluster?'
+      'What apiVersion does HelmRelease use?'
       'Is Flux installed at all?'
     """
     log.info("get_kubernetes_api_versions")
@@ -241,122 +232,125 @@ def get_kubernetes_api_versions() -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════
-# RECONCILIATION — triggers sync, confirm with user first
+# GITLAB — repository read-only
 # ══════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-def reconcile_flux_source(
-    kind: str, name: str, namespace: str,
+def get_gitlab_file(
+    file_path: str,
+    ref: str = "main",
 ) -> dict:
     """
-    RECONCILE — Force immediate re-fetch from the upstream source.
+    GITLAB — Fetch a single config file from the GitLab repository.
 
-    Supported kinds:
-      GitRepository, HelmRepository, OCIRepository, HelmChart, Bucket
+    file_path — path inside the repo
+                e.g. 'clusters/nwdaf-cd/helmrelease.yaml'
+    ref       — branch, tag, or commit SHA (default: main)
 
-    Use after fixing a source issue (auth secret, URL, credentials)
-    to trigger re-fetch without waiting for the next interval.
+    Returns the raw file content so the LLM can compare it
+    with the live cluster state from get_kubernetes_resources.
 
-    ALWAYS confirm with user before calling.
+    Use for:
+      'Show me the HelmRelease config in Git'
+      'What image tag is defined in the Git manifest?'
+      'What values does the kustomization.yaml define?'
+      'Compare the Git config with what is running on the cluster'
     """
-    log.info(f"reconcile_flux_source kind={kind} name={name} ns={namespace}")
-    return flux_tools.reconcile_flux_source(kind, name, namespace)
+    log.info(f"get_gitlab_file path={file_path} ref={ref}")
+    return gitlab_tools.get_gitlab_file(file_path, ref)
 
 
 @mcp.tool()
-def reconcile_flux_kustomization(
-    name: str,
-    namespace: str,
-    with_source: bool = False,
+def list_gitlab_files(
+    path: str       = "",
+    ref: str        = "main",
+    recursive: bool = False,
 ) -> dict:
     """
-    RECONCILE — Force immediate re-apply of a Kustomization.
+    GITLAB — List files and folders in the GitLab repository.
 
-    with_source=True also reconciles the upstream GitRepository first.
-    Use this when the source itself may be stale.
+    path      — folder path inside the repo (empty = root)
+    ref       — branch, tag, or commit SHA (default: main)
+    recursive — list all files recursively (default: false)
 
-    Use after fixing a Kustomization issue (missing secret,
-    path error, dependency problem) to apply the fix immediately.
-
-    ALWAYS confirm with user before calling.
+    Use to discover what config files exist:
+      'What Flux config files are in the clusters/ folder?'
+      'List all HelmRelease YAML files in the repo'
+      'Show me the folder structure for nwdaf-cd'
     """
-    log.info(f"reconcile_flux_kustomization name={name} ns={namespace}")
-    return flux_tools.reconcile_flux_kustomization(
-        name, namespace, with_source)
+    log.info(f"list_gitlab_files path={path} ref={ref}")
+    return gitlab_tools.list_gitlab_files(path, ref, recursive)
 
 
 @mcp.tool()
-def reconcile_flux_helmrelease(
-    name: str,
-    namespace: str,
-    with_source: bool = False,
+def get_gitlab_commits(
+    ref: str   = "main",
+    path: str  = "",
+    limit: int = 10,
 ) -> dict:
     """
-    RECONCILE — Force immediate Helm install/upgrade.
+    GITLAB — Get recent commits from the repository.
 
-    with_source=True also reconciles the HelmRepository/HelmChart first.
-    Use this when the chart itself may have been updated.
+    ref   — branch or tag (default: main)
+    path  — filter commits that touched a specific file or folder
+    limit — number of commits (default: 10)
 
-    Use after fixing a HelmRelease issue (values error, image tag,
-    missing secret) to retry the Helm upgrade immediately.
-
-    ALWAYS confirm with user before calling.
+    Use to correlate recent changes with failures:
+      'What was pushed to main recently?'
+      'Who changed the HelmRelease config?'
+      'Show commits that touched nwdaf-cd before it broke'
+      'What changed before the deployment started failing?'
     """
-    log.info(f"reconcile_flux_helmrelease name={name} ns={namespace}")
-    return flux_tools.reconcile_flux_helmrelease(
-        name, namespace, with_source)
-
-
-# ══════════════════════════════════════════════════════════════════
-# SUSPEND / RESUME — confirm with user first
-# ══════════════════════════════════════════════════════════════════
-
-@mcp.tool()
-def suspend_flux_reconciliation(
-    kind: str, name: str, namespace: str,
-) -> dict:
-    """
-    SUSPEND — Stop Flux reconciling a resource (spec.suspend=true).
-
-    Use to pause a broken resource while manually fixing the root cause.
-    Flux will not overwrite manual changes while suspended.
-
-    Supported kinds: any Flux CRD kind
-      Kustomization, HelmRelease, GitRepository,
-      HelmRepository, OCIRepository, HelmChart, etc.
-
-    Standard fix workflow:
-      1. suspend           → Flux stops touching it
-      2. Fix root cause    → edit secret, fix values, update image
-      3. resume            → Flux reconciles again
-      4. reconcile         → trigger immediately if needed
-
-    ALWAYS confirm with user before calling.
-    """
-    log.info(f"suspend kind={kind} name={name} ns={namespace}")
-    return flux_tools.suspend_flux_reconciliation(kind, name, namespace)
+    log.info(f"get_gitlab_commits ref={ref} path={path}")
+    return gitlab_tools.get_gitlab_commits(ref, path, limit)
 
 
 @mcp.tool()
-def resume_flux_reconciliation(
-    kind: str, name: str, namespace: str,
+def get_gitlab_commit_diff(sha: str) -> dict:
+    """
+    GITLAB — Get the exact file changes in a specific commit.
+
+    sha — full or short commit SHA
+
+    Use to see precisely what changed:
+      'What files did this commit change?'
+      'Show me the diff for the last deployment commit'
+      'What exactly changed in commit abc1234?'
+    """
+    log.info(f"get_gitlab_commit_diff sha={sha}")
+    return gitlab_tools.get_gitlab_commit_diff(sha)
+
+
+@mcp.tool()
+def compare_gitlab_to_cluster(
+    file_path: str,
+    ref: str = "main",
 ) -> dict:
     """
-    RESUME — Re-enable Flux reconciliation (spec.suspend=false).
+    GITLAB + CLUSTER — Fetch a config file from GitLab and prompt
+    the LLM to compare it with the live cluster state.
 
-    Use after fixing the root cause on a suspended resource.
-    Flux will reconcile on the next interval.
-    Call the matching reconcile tool after this to trigger immediately.
+    This is the key tool for diagnosing:
+    'I pushed to GitLab but changes are not on the cluster'
 
-    ALWAYS confirm with user before calling.
+    It fetches the Git version of the config and tells the LLM
+    to call get_kubernetes_resources for the same resource so
+    it can compare spec fields and find the difference.
+
+    Use for:
+      'Is the cluster running what is in Git?'
+      'Did my push actually get applied to the cluster?'
+      'Compare the HelmRelease in Git with the cluster'
+      'Why is the cluster not matching what I pushed?'
     """
-    log.info(f"resume kind={kind} name={name} ns={namespace}")
-    return flux_tools.resume_flux_reconciliation(kind, name, namespace)
+    log.info(f"compare_gitlab_to_cluster path={file_path} ref={ref}")
+    return gitlab_tools.compare_gitlab_to_cluster(file_path, ref)
 
 
 # ══════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    log.info("Flux MCP Server starting — stdio transport")
-    log.info(f"Namespaces: {flux_tools.NAMESPACES}")
+    log.info("Flux MCP Server starting (READ-ONLY) — stdio transport")
+    log.info(f"Cluster namespaces: {flux_tools.NAMESPACES}")
+    log.info("No write operations available — diagnosis only")
     mcp.run()

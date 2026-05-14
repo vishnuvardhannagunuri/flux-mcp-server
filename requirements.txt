@@ -1,2 +1,3 @@
 mcp>=1.0.0
 kubernetes>=29.0.0
+# No extra packages needed for GitLab — uses stdlib urllib only
